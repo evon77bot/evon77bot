@@ -6,7 +6,7 @@ import os
 from datetime import datetime
 
 # import os
-TOKEN = os.getenv(BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 
 # Store participants (username → ticket count)
 participants = {}
@@ -241,3 +241,4 @@ app.add_handler(CallbackQueryHandler(button_click, pattern="enter"))
 print("Evon77bot is running...")
 
 app.run_polling()
+
