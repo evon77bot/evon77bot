@@ -5,8 +5,8 @@ import csv
 import os
 from datetime import datetime
 
-# Bot token from BotFather
-TOKEN = "8478480447:AAEExUbuUIxvIG7BvNUn1eS1OIG4QcXtw50"
+# import os
+TOKEN = os.getenv(BOT_TOKEN")
 
 # Store participants (username → ticket count)
 participants = {}
@@ -239,4 +239,5 @@ app.add_handler(CommandHandler("history", history))
 app.add_handler(CallbackQueryHandler(button_click, pattern="enter"))
 
 print("Evon77bot is running...")
+
 app.run_polling()
