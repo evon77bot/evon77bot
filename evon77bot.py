@@ -1,97 +1,142 @@
-from telegram import Update, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+# evon77bot.py
+import os
 import random
 import csv
-import os
 from datetime import datetime
+from telegram import (
+    Update,
+    ChatMember,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    CallbackQueryHandler
+)
 
-# import os
+# Get token from environment (Render: set BOT_TOKEN)
 TOKEN = os.getenv("BOT_TOKEN")
 
-# Store participants (username → ticket count)
-participants = {}
+# Data structures
+participants = {}   # key -> {'display': str, 'tickets': int}
 winner_count = 1
-draw_number = 0  # counter for each draw
-
-# History file
+draw_number = 0
 HISTORY_FILE = "draw_history.csv"
 
-# Ensure history file exists with headers
+# Ensure history file exists
 if not os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as csvfile:
-        writer = csv.writer(csvfile)
+    with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
         writer.writerow(["Draw Number", "Timestamp", "Username", "Tickets", "Winner?"])
 
-# /start command
+# -----------------------
+# Helpers
+# -----------------------
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        return member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
+    except Exception:
+        return False
+
+def normalize_arg_name(arg: str) -> str:
+    return arg.lstrip("@").strip()
+
+def find_participant_key_by_name(name: str):
+    """Find participant key by display name (case-insensitive)."""
+    lower = name.lower()
+    for k, v in participants.items():
+        if v['display'].lstrip("@").lower() == lower or k.lstrip("@").lower() == lower:
+            return k
+    return None
+
+# -----------------------
+# Commands & Handlers
+# -----------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🎉 Welcome to Evon77bot Lucky Draw!\n"
-        "➡️ Wait for admin to start a new draw.\n"
-        "Admins use /newdraw <winners> to begin."
+        "🎉 Welcome to Evon77bot Lucky Draw!\n\n"
+        "Admins: /newdraw <winners>\n"
+        "Users: press the button or use /enter to join (default 1 ticket).\n"
+        "Admins: /participants, /addticket, /removeticket, /setticket, /draw, /history"
     )
 
-# Check admin
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
-    return member.status in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]
+# /enter - user joins with default 1 ticket (cannot self-increase)
+async def enter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    key = f"@{user.username}" if user.username else f"{user.first_name}_{user.id}"
+    display = f"@{user.username}" if user.username else user.first_name
 
-# Button handler (user entry)
+    if key in participants:
+        await update.message.reply_text(f"⚠️ {display}, you are already in the draw with {participants[key]['tickets']} ticket(s).")
+        return
+
+    participants[key] = {"display": display, "tickets": 1}
+    await update.message.reply_text(f"✅ {display} entered the draw with 1 ticket!")
+
+# CallbackQuery (button press) - same semantics as /enter
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user = query.from_user.username or query.from_user.first_name
     await query.answer()
+    user = query.from_user
+    key = f"@{user.username}" if user.username else f"{user.first_name}_{user.id}"
+    display = f"@{user.username}" if user.username else user.first_name
 
-    if user in participants:
-        await query.message.reply_text(
-            f"⚠️ {user}, you are already in the draw with {participants[user]} ticket(s)."
-        )
-    else:
-        participants[user] = 1  # default = 1 ticket
-        await query.message.reply_text(f"✅ {user} entered the lucky draw with 1 ticket!")
+    if key in participants:
+        # Reply as a short message to the chat
+        await query.message.reply_text(f"⚠️ {display}, you already entered with {participants[key]['tickets']} ticket(s).")
+        return
 
-# /newdraw (admin only)
+    participants[key] = {"display": display, "tickets": 1}
+    await query.message.reply_text(f"✅ {display} entered the draw with 1 ticket!")
+
+# /newdraw <winners> - admin only, post the enter button
 async def newdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global winner_count, participants
-
     if not await is_admin(update, context):
         await update.message.reply_text("🚫 Only admins can start a draw.")
         return
 
-    try:
-        winner_count = int(context.args[0])
-    except:
+    if not context.args:
         await update.message.reply_text("⚠️ Usage: /newdraw <winners>")
         return
 
-    participants = {}  # reset participants
-
+    try:
+        winner_count = int(context.args[0])
+        if winner_count < 1:
+            raise ValueError()
+    except:
+        await update.message.reply_text("⚠️ Winners must be a positive integer. Example: /newdraw 2")
+        return
+        
+        participants = {}  # reset participants for the new round
     keyboard = [[InlineKeyboardButton("🎟️ Enter Lucky Draw", callback_data="enter")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
-        f"🎁 New lucky draw started!\n"
-        f"🏆 {winner_count} winner(s) will be selected!\n"
-        f"➡️ Press the button below to join!",
+        f"🎁 New lucky draw started!\n🏆 {winner_count} winner(s) will be picked.\n➡️ Press the button to join!",
         reply_markup=reply_markup
     )
 
-# /participants (admin only)
+# /participants - admin only
 async def participants_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("🚫 Only admins can see the participant list.")
+        await update.message.reply_text("🚫 Only admins can view participants.")
         return
 
     if not participants:
         await update.message.reply_text("ℹ️ No participants yet.")
         return
 
-    message = "👥 Participant List:\n"
-    for user, tickets in participants.items():
-        message += f"- {user}: {tickets} ticket(s)\n"
+    lines = ["👥 Participant List:"]
+    for k, v in participants.items():
+        lines.append(f"- {v['display']}: {v['tickets']} ticket(s)")
+    await update.message.reply_text("\n".join(lines))
 
-    await update.message.reply_text(message)
-
-# /addticket (admin only)
+# /addticket @name N  (admin)
 async def addticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         await update.message.reply_text("🚫 Only admins can add tickets.")
@@ -101,21 +146,24 @@ async def addticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usage: /addticket @username <number>")
         return
 
-    username = context.args[0].lstrip("@")
+    name = normalize_arg_name(context.args[0])
     try:
         extra = int(context.args[1])
     except:
         await update.message.reply_text("⚠️ Ticket number must be an integer.")
         return
 
-    if username not in participants:
-        participants[username] = 1  # ensure user exists
-    participants[username] += extra
+    key = find_participant_key_by_name(name)
+    if key is None:
+        # user not in list — create with default 1 plus extra
+        key = f"@{name}"
+        participants[key] = {"display": f"@{name}", "tickets": 1 + extra}
+    else:
+        participants[key]['tickets'] += extra
 
-    await update.message.reply_text(
-        f"✅ Gave {extra} extra ticket(s) to {username}. Total: {participants[username]}"
-    )
-# /removeticket (admin only)
+    await update.message.reply_text(f"✅ {participants[key]['display']} total tickets: {participants[key]['tickets']}")
+
+# /removeticket @name N  (admin)
 async def removeticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
         await update.message.reply_text("🚫 Only admins can remove tickets.")
@@ -125,34 +173,32 @@ async def removeticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Usage: /removeticket @username <number>")
         return
 
-    username = context.args[0].lstrip("@")
+    name = normalize_arg_name(context.args[0])
     try:
         remove = int(context.args[1])
     except:
         await update.message.reply_text("⚠️ Ticket number must be an integer.")
         return
 
-    if username not in participants:
-        await update.message.reply_text(f"ℹ️ {username} is not in the draw.")
+    key = find_participant_key_by_name(name)
+    if key is None:
+        await update.message.reply_text("ℹ️ That user is not in the draw.")
         return
 
-    participants[username] = max(1, participants[username] - remove)  # never below 1
+    participants[key]['tickets'] = max(1, participants[key]['tickets'] - remove)
+    await update.message.reply_text(f"✅ {participants[key]['display']} total tickets: {participants[key]['tickets']}")
 
-    await update.message.reply_text(
-        f"✅ Removed {remove} ticket(s) from {username}. Total: {participants[username]}"
-    )
-
-# /setticket (admin only)
+# /setticket @name N  (admin)
 async def setticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("🚫 Only admins can set tickets directly.")
+        await update.message.reply_text("🚫 Only admins can set tickets.")
         return
 
     if len(context.args) < 2:
         await update.message.reply_text("⚠️ Usage: /setticket @username <number>")
         return
 
-    username = context.args[0].lstrip("@")
+    name = normalize_arg_name(context.args[0])
     try:
         count = int(context.args[1])
         if count < 1:
@@ -161,84 +207,101 @@ async def setticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Ticket number must be an integer.")
         return
 
-    participants[username] = count
-    await update.message.reply_text(
-        f"✅ Set {username}'s tickets to {count}."
-    )
+    key = find_participant_key_by_name(name)
+    if key is None:
+        key = f"@{name}"
+        participants[key] = {"display": f"@{name}", "tickets": count}
+    else:
+        participants[key]['tickets'] = count
 
-# /draw (admin only) + CSV export with history
-async def draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global participants, winner_count, draw_number
+    await update.message.reply_text(f"✅ {participants[key]['display']}'s tickets set to {participants[key]['tickets']}")
 
-    if not await is_admin(update, context):
+# /draw (admin only) -> picks winners and exports CSV + appends to history
+async def draw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global participants, draw_number
+
+if not await is_admin(update, context):
         await update.message.reply_text("🚫 Only admins can end the draw.")
         return
 
     pool = []
-    for user, tickets in participants.items():
-        pool.extend([user] * tickets)
+    for k, v in participants.items():
+        pool.extend([k] * v['tickets'])
 
-    if pool:
-        draw_number += 1
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not pool:
+        await update.message.reply_text("⚠️ No participants to draw from.")
+        return
 
-        random.shuffle(pool)
-        winners = list(set(pool[:winner_count]))
-        mentions = ", ".join(winners)
-        await update.message.reply_text(
-            f"🏆 Lucky Draw #{draw_number} Results 🎉\n"
-            f"📅 {now}\n"
-            f"👑 Winners: {mentions}"
-        )
+    draw_number += 1
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    random.shuffle(pool)
 
-        # Save participants to per-draw CSV
-        filename = f"draw_{draw_number}.csv"
-        with open(filename, "w", newline="", encoding="utf-8") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(["Draw Number", "Timestamp", "Username", "Tickets", "Winner?"])
-            for user, tickets in participants.items():
-                winner_flag = "YES" if user in winners else "NO"
-                writer.writerow([draw_number, now, user, tickets, winner_flag])
+    winners = []
+    for entry in pool:
+        if len(winners) >= winner_count:
+            break
+        if entry not in winners:
+            winners.append(entry)
 
-        # Send the per-draw CSV
-        await update.message.reply_document(document=InputFile(filename))
-        os.remove(filename)
+    winner_displays = [participants[w]['display'] for w in winners]
+    await update.message.reply_text(
+        f"🏆 Lucky Draw #{draw_number} Results\n📅 {now}\n👑 Winners: {', '.join(winner_displays)}"
+    )
 
-        # Append to permanent history file
-        with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as csvfile:
-            writer = csv.writer(csvfile)
-            for user, tickets in participants.items():
-                winner_flag = "YES" if user in winners else "NO"
-                writer.writerow([draw_number, now, user, tickets, winner_flag])
+    # write per-draw CSV
+    filename = f"draw_{draw_number}.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Draw Number", "Timestamp", "Username", "Tickets", "Winner?"])
+        for k, v in participants.items():
+            writer.writerow([draw_number, now, v['display'], v['tickets'], "YES" if k in winners else "NO"])
 
-    else:
-        await update.message.reply_text("⚠️ No participants joined this draw.")
+    # send CSV file
+    await update.message.reply_document(document=InputFile(filename))
+    os.remove(filename)
+
+    # append to history
+    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        for k, v in participants.items():
+            writer.writerow([draw_number, now, v['display'], v['tickets'], "YES" if k in winners else "NO"])
 
     participants = {}  # reset for next round
 
-# /history (admin only) → download master history log
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# /history (admin only) -> download master history file
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_admin(update, context):
-        await update.message.reply_text("🚫 Only admins can request the history log.")
+        await update.message.reply_text("🚫 Only admins can request history.")
         return
-
     if os.path.exists(HISTORY_FILE):
         await update.message.reply_document(document=InputFile(HISTORY_FILE))
     else:
-        await update.message.reply_text("⚠️ No history file found yet.")
-# Run the bot
-app = Application.builder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("newdraw", newdraw))
-app.add_handler(CommandHandler("participants", participants_list))
-app.add_handler(CommandHandler("addticket", addticket))
-app.add_handler(CommandHandler("removeticket", removeticket))
-app.add_handler(CommandHandler("setticket", setticket))
-app.add_handler(CommandHandler("draw", draw))
-app.add_handler(CommandHandler("history", history))
-app.add_handler(CallbackQueryHandler(button_click, pattern="enter"))
+        await update.message.reply_text("⚠️ No history file found.")
 
-print("Evon77bot is running...")
+# -----------------------
+# App & Handlers registration
+# -----------------------
+def main():
+    app = Application.builder().token(TOKEN).build()
 
-app.run_polling()
+    # basic commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("enter", enter_cmd))
+    app.add_handler(CommandHandler("newdraw", newdraw))
+    app.add_handler(CommandHandler("participants", participants_list))
+    app.add_handler(CommandHandler("addticket", addticket))
+    app.add_handler(CommandHandler("removeticket", removeticket))
+    app.add_handler(CommandHandler("setticket", setticket))
+    app.add_handler(CommandHandler("draw", draw_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
 
+    # button callback (pattern ^enter$)
+    app.add_handler(CallbackQueryHandler(button_click, pattern="^enter$"))
+
+    # debug message so Render logs show the bot is ready
+    print("✅ Evon77bot connected to Telegram and is now running!")
+
+    app.run_polling()
+
+if name == "main":
+    main()
