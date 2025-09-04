@@ -35,7 +35,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 # ======================
-# /enter command
+# /enter command (1 ticket only, no spamming)
 # ======================
 async def enter_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -44,12 +44,11 @@ async def enter_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id not in participants:
         participants[user_id] = {"username": username, "tickets": 1}
+        await update.message.reply_text(f"🎟 {username} entered the lucky draw! (1 ticket)")
     else:
-        participants[user_id]["tickets"] += 1
-
-    await update.message.reply_text(
-        f"🎟 {username} entered the lucky draw! (Total tickets: {participants[user_id]['tickets']})"
-    )
+        await update.message.reply_text(
+            f"⚠️ {username}, you already joined! You have {participants[user_id]['tickets']} ticket(s)."
+        )
 
 # ======================
 # Button handler (Join Draw)
@@ -57,18 +56,16 @@ async def enter_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "enter":
-        user = query.from_user
-        user_id = user.id
-        username = user.username or user.first_name
+    user = query.from_user
+    user_id = user.id
+    username = user.username or user.first_name
 
-        if user_id not in participants:
-            participants[user_id] = {"username": username, "tickets": 1}
-        else:
-            participants[user_id]["tickets"] += 1
-
+    if user_id not in participants:
+        participants[user_id] = {"username": username, "tickets": 1}
+        await query.edit_message_text(f"🎟 {username} entered the lucky draw! (1 ticket)")
+    else:
         await query.edit_message_text(
-            f"🎟 {username} entered the lucky draw! (Total tickets: {participants[user_id]['tickets']})"
+            f"⚠️ {username}, you already joined! You have {participants[user_id]['tickets']} ticket(s)."
         )
 
 # ======================
@@ -120,9 +117,7 @@ async def draw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Save to history
     save_winner(winner)
 
-    await update.message.reply_text(
-        f"🏆 Congratulations {winner}! You won the lucky draw! 🎉"
-    )
+    await update.message.reply_text(f"🏆 Congratulations {winner}! You won the lucky draw! 🎉")
 
 # ======================
 # /history command (admin only)
