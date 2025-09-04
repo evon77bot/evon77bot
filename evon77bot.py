@@ -220,7 +220,7 @@ async def setticket(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def draw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global participants, draw_number
 
-if not await is_admin(update, context):
+    if not await is_admin(update, context):
         await update.message.reply_text("🚫 Only admins can end the draw.")
         return
 
@@ -305,3 +305,4 @@ def main():
 
 if name == "main":
     main()
+
