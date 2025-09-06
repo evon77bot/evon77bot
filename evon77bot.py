@@ -1,350 +1,499 @@
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+# evon77bot.py
+# Evon77Bot v2 - in-memory mode, spinning wheel PNG per winner, scheduled draws, bonus tickets (admin toggles)
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
-import random
-import csv
-import os
-import asyncio
-from datetime import datetime
-import logging
-import pickle
-import atexit
+import os, random, csv, asyncio, json
+from datetime import datetime, date, time as dtime, timedelta
+from PIL import Image, ImageDraw, ImageFont
 
-# Set up logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ----------------- Config (environment toggles) -----------------
+TOKEN = os.getenv("BOT_TOKEN")  # required
+# If REQUIRE_MEMBERSHIP env var set to "True" (case-ins) then membership is enforced:
+REQUIRE_MEMBERSHIP = os.getenv("REQUIRE_MEMBERSHIP", "False").lower() == "true"
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "")  # without '@'
 
-# Get token from Render environment
-TOKEN = os.getenv("BOT_TOKEN")
+# Wheel image settings
+WHEEL_SIZE = (600, 600)
+WHEEL_SEGMENTS = 12  # visual segments (doesn't map to names)
+WHEEL_COLORS = [
+    (239, 71, 111), (255, 209, 102), (6, 214, 160), (17, 138, 178),
+    (7, 59, 76), (255, 99, 72), (255, 159, 67), (66, 135, 245),
+    (123, 104, 238), (255, 127, 80), (46, 204, 113), (255, 204, 153)
+]
 
-# Store participants (user_id → {"username": str, "tickets": int})
-participants = {}
-winner_count = 1
-draw_number = 0  # counter for each draw
+# ----------------- In-memory state -----------------
+participants = {}  # user_id (str) -> {"username": str, "tickets": int, "wins": int}
+history_rows = []  # list of (draw_number, timestamp, prize, winners_list)
+draw_counter = 0
+bonus_enabled = False
+bonus_chance = 0.15
+bonus_min = 2
+bonus_max = 3
 
-# History file
-HISTORY_FILE = "draw_history.csv"
+scheduled_tasks = []  # keeps info about scheduled draws for display (not persistent)
 
-# Initialize history file if it doesn't exist
-if not os.path.exists(HISTORY_FILE):
+# Runtime CSV filename (runtime-only; wiped on redeploy)
+HISTORY_CSV = "draw_history_runtime.csv"
+
+# ensure CSV header
+if not os.path.exists(HISTORY_CSV):
+    with open(HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Draw#", "Timestamp", "Prize", "Winners"])
+
+# ----------------- Utilities -----------------
+def save_history_row(draw_no, prize, winners):
+    ts = datetime.now().isoformat()
+    history_rows.append((draw_no, ts, prize, winners.copy()))
+    with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([draw_no, ts, prize or "-", ", ".join(winners)])
+
+def save_participants_snapshot():  # not persistent intentionally; helper if you want to inspect
     try:
-        with open(HISTORY_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["Draw Number", "Date", "Winners"])
-    except IOError as e:
-        logger.error(f"Error creating history file: {e}")
+        with open("participants_snapshot.json", "w", encoding="utf-8") as f:
+            json.dump(participants, f, indent=2)
+    except:
+        pass
 
-# Load previous draw number from history
-try:
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader)  # Skip header
-            rows = list(reader)
-            if rows:
-                draw_number = int(rows[-1][0])
-except (IOError, ValueError, IndexError) as e:
-    logger.error(f"Error loading history: {e}")
-
-# --- Helper Functions ---
-def is_admin(chat_member):
-    return chat_member.status in ["administrator", "creator"]
-
-def save_history(draw_num, date, winners):
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([draw_num, date, ", ".join(winners)])
-    except IOError as e:
-        logger.error(f"Error saving to history: {e}")
+        member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+        return member.status in ("administrator", "creator")
+    except:
+        return False
 
-def save_participants():
+# simple wheel PNG generator (colorful segments, pointer at top). Returns filepath.
+def generate_wheel_png(out_path, highlight_index=None, segments=WHEEL_SEGMENTS, size=WHEEL_SIZE):
+    w, h = size
+    cx, cy = w//2, h//2
+    r = int(min(cx, cy)*0.9)
+    im = Image.new("RGB", (w, h), (24,24,24))
+    draw = ImageDraw.Draw(im)
+    # font (default)
     try:
-        with open("participants.pkl", "wb") as f:
-            pickle.dump(participants, f)
-    except Exception as e:
-        logger.error(f"Error saving participants: {e}")
+        font = ImageFont.truetype("DejaVuSans.ttf", 18)
+    except:
+        font = ImageFont.load_default()
 
-def load_participants():
-    global participants
-    try:
-        with open("participants.pkl", "rb") as f:
-            participants = pickle.load(f)
-    except FileNotFoundError:
-        participants = {}
-    except Exception as e:
-        logger.error(f"Error loading participants: {e}")
-        participants = {}
+    # draw segments
+    angle_per = 360.0 / segments
+    start_angle = -90  # pointer at top
+    for i in range(segments):
+        color = WHEEL_COLORS[i % len(WHEEL_COLORS)]
+        a0 = start_angle + i*angle_per
+        a1 = a0 + angle_per
+        draw.pieslice([cx-r, cy-r, cx+r, cy+r], a0, a1, fill=color)
+        # optional small segment border
+        draw.arc([cx-r, cy-r, cx+r, cy+r], a0, a1, fill=(20,20,20))
 
-# Load participants at startup and register save function on exit
-load_participants()
-atexit.register(save_participants)
+    # draw center circle
+    draw.ellipse([cx-80, cy-80, cx+80, cy+80], fill=(20,20,20))
+    # pointer triangle at top
+    tri = [(cx-12, cy-r-10), (cx+12, cy-r-10), (cx, cy-r+20)]
+    draw.polygon(tri, fill=(255,255,255))
 
-# --- Commands ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # highlight segment if provided (draw outer border)
+    if highlight_index is not None:
+        a0 = start_angle + highlight_index*angle_per
+        a1 = a0 + angle_per
+        draw.pieslice([cx-r-6, cy-r-6, cx+r+6, cy+r+6], a0, a1, outline=(255,255,255), width=6)
+
+    # footer text
+    draw.text((10, h-30), "Evon77 Lucky Draw", fill=(200,200,200), font=font)
+
+    im.save(out_path, format="PNG")
+    return out_path
+
+# ----------------- Handlers -----------------
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🎟 Enter Draw", callback_data="enter_draw")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Send a new message each time to ensure the button is always visible
-    await update.message.reply_text(
-        "🎉 Welcome to Evon77Bot Lucky Draw!\n\nClick below to join:",
-        reply_markup=reply_markup,
-    )
+    await update.message.reply_text("🎉 Welcome! Click to join the current lucky draw (button stays visible until admin runs the draw).", reply_markup=reply_markup)
 
-async def enter_draw_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user = query.from_user
-    user_id = user.id
-    username = user.username or user.full_name
-
-    if user_id not in participants:
-        participants[user_id] = {"username": username, "tickets": 1}
-        try:
-            await query.edit_message_text(f"✅ {username}, you have entered the draw with 1 ticket!")
-        except Exception as e:
-            if "Message is not modified" in str(e):
-                # Message is already correct, no need to edit
-                pass
-            else:
-                logger.error(f"Error in enter_draw_callback: {e}")
+# Allow both callback button and /enter command
+async def enter_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # supports both CallbackQuery and Command
+    if update.callback_query:
+        query = update.callback_query
+        user = query.from_user
+        await query.answer()  # close loading state
+        chat = query.message.chat
+        origin = "callback"
     else:
+        user = update.effective_user
+        chat = update.effective_chat
+        origin = "command"
+
+    uid = str(user.id)
+    username = user.username or (user.full_name if hasattr(user, "full_name") else user.first_name)
+
+    # membership check if enabled (uses env var)
+    if REQUIRE_MEMBERSHIP and REQUIRED_CHANNEL:
         try:
-            await query.edit_message_text(f"⚠️ {username}, you are already in the draw.")
-        except Exception as e:
-            if "Message is not modified" in str(e):
-                pass
+            member = await context.bot.get_chat_member(f"@{REQUIRED_CHANNEL}", user.id)
+            if member.status not in ("member","administrator","creator"):
+                if origin == "callback":
+                    await query.message.reply_text("⚠️ You must join the required channel/group before entering.")
+                else:
+                    await update.message.reply_text("⚠️ You must join the required channel/group before entering.")
+                return
+        except Exception:
+            # could not verify
+            if origin == "callback":
+                await query.message.reply_text("⚠️ Could not verify membership. Please ensure the bot can access the channel.")
             else:
-                logger.error(f"Error in enter_draw_callback: {e}")
-    
-    # Save participants after modification
-    save_participants()
-
-async def list_participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-        
-        if not is_admin(chat_member):
-            await update.message.reply_text("⚠️ This command is for admins only.")
+                await update.message.reply_text("⚠️ Could not verify membership. Please ensure the bot can access the channel.")
             return
-    except Exception as e:
-        await update.message.reply_text("⚠️ Error verifying admin status.")
-        logger.error(f"Error in list_participants: {e}")
+
+    if uid in participants:
+        msg = f"⚠️ {username}, you already joined (tickets: {participants[uid]['tickets']}). Ask admin for more tickets."
+        if origin == "callback":
+            await query.message.reply_text(msg)
+        else:
+            await update.message.reply_text(msg)
         return
 
+    # base ticket
+    tickets = 1
+    note = ""
+    if bonus_enabled:
+        if random.random() < bonus_chance:
+            bonus = random.randint(bonus_min, bonus_max)
+            tickets += bonus
+            note = f" (bonus +{bonus})"
+
+    participants[uid] = {"username": username, "tickets": tickets, "wins": 0}
+    save_participants_snapshot()
+    msg = f"✅ {username} entered with {tickets} ticket(s){note}."
+    if origin == "callback":
+        await query.message.reply_text(msg)
+    else:
+        await update.message.reply_text(msg)
+
+# admin: list participants
+async def participants_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("⚠️ This command is for admins only.")
+        return
     if not participants:
-        await update.message.reply_text("⚠️ No participants yet.")
+        await update.message.reply_text("📭 No participants yet.")
         return
+    lines = ["📋 Participants:"]
+    for info in participants.values():
+        lines.append(f"- {info['username']}: {info['tickets']} ticket(s)")
+    await update.message.reply_text("\n".join(lines))
 
-    msg = "📋 Current Participants:\n\n"
-    for p in participants.values():
-        msg += f"- {p['username']} ({p['tickets']} 🎟)\n"
-    
-    msg += f"\nTotal: {len(participants)} participants, {sum(p['tickets'] for p in participants.values())} tickets"
-
-    await update.message.reply_text(msg)
-
-async def add_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-        
-        if not is_admin(chat_member):
-            await update.message.reply_text("⚠️ This command is for admins only.")
-            return
-    except Exception as e:
-        await update.message.reply_text("⚠️ Error verifying admin status.")
-        logger.error(f"Error in add_tickets: {e}")
+# admin: add tickets
+async def addtickets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
         return
-
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /addtickets <username> <number>")
+        await update.message.reply_text("Usage: /addtickets @username N")
         return
-
-    username = context.args[0].lstrip("@").lower()
+    name = context.args[0].lstrip("@")
     try:
-        tickets = int(context.args[1])
-        if tickets <= 0:
-            await update.message.reply_text("⚠️ Please provide a positive number of tickets.")
-            return
-    except ValueError:
-        await update.message.reply_text("⚠️ Please provide a valid number of tickets.")
+        n = int(context.args[1])
+    except:
+        await update.message.reply_text("Ticket count must be a number.")
         return
-
-    for uid, data in participants.items():
-        if data["username"].lower() == username:
-            data["tickets"] += tickets
-            await update.message.reply_text(f"✅ Added {tickets} tickets to {data['username']}. They now have {data['tickets']} tickets.")
-            save_participants()
+    for uid, info in participants.items():
+        if info["username"].lstrip("@").lower() == name.lower():
+            info["tickets"] += n
+            save_participants_snapshot()
+            await update.message.reply_text(f"✅ Added {n} tickets to {info['username']}. Now {info['tickets']}.")
             return
+    await update.message.reply_text("User not found. They must enter first.")
 
-    await update.message.reply_text(f"⚠️ User @{username} not found in participants.")
-
-async def draw_winner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global draw_number
-    user_id = update.effective_user.id
-    try:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-        
-        if not is_admin(chat_member):
-            await update.message.reply_text("⚠️ This command is for admins only.")
-            return
-    except Exception as e:
-        await update.message.reply_text("⚠️ Error verifying admin status.")
-        logger.error(f"Error in draw_winner: {e}")
+# admin: reset user's tickets to 1
+async def resettickets_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
         return
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /resettickets @username")
+        return
+    name = context.args[0].lstrip("@")
+    for uid, info in participants.items():
+        if info["username"].lstrip("@").lower() == name.lower():
+            info["tickets"] = 1
+            save_participants_snapshot()
+            await update.message.reply_text(f"✅ Reset {info['username']}'s tickets to 1.")
+            return
+    await update.message.reply_text("User not found.")
 
+# draw command: /draw [N] [Prize words...]
+async def draw_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global draw_counter
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
     if not participants:
-        await update.message.reply_text("⚠️ No participants in the draw.")
+        await update.message.reply_text("No participants.")
         return
 
-    # Default 1 winner
-    num_winners = 1
+    # parse args
+    num = 1
+    prize = ""
     if context.args:
-        try:
-            num_winners = max(1, int(context.args[0]))
-        except ValueError:
-            await update.message.reply_text("⚠️ Please provide a valid number. Example: /draw 3")
-            return
+        if context.args[0].isdigit():
+            num = max(1, int(context.args[0]))
+            prize = " ".join(context.args[1:]).strip()
+        else:
+            prize = " ".join(context.args).strip()
 
-    # Build weighted list for drawing
-    weighted_list = []
-    for p in participants.values():
-        weighted_list.extend([p["username"]] * p["tickets"])
-
-    if num_winners > len(weighted_list):
-        await update.message.reply_text(f"⚠️ Not enough tickets for {num_winners} winners. There are only {len(weighted_list)} tickets.")
-        return
+    # build ticket pool
+    pool = []
+    for uid, info in participants.items():
+        pool.extend([info["username"]] * int(info["tickets"]))
 
     total_participants = len(participants)
-    total_tickets = len(weighted_list)
-
-    # 🎰 Shuffle animation
-    try:
-        shuffle_msg = await update.message.reply_text("🎰 Rolling the wheel...")
-        for i in range(5):
-            fake_name = random.choice(weighted_list) if weighted_list else "No participants"
-            try:
-                await shuffle_msg.edit_text(f"🎰 Spinning... maybe {fake_name}?")
-            except Exception as e:
-                if "Message is not modified" not in str(e):
-                    logger.error(f"Error in draw animation: {e}")
-            await asyncio.sleep(1)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error during animation: {e}")
-        logger.error(f"Error in draw_winner animation: {e}")
-        return
-
-    # Draw winners
+    total_tickets = len(pool)
     winners = []
-    for _ in range(num_winners):
-        if not weighted_list:
-            break
-        winner = random.choice(weighted_list)
-        winners.append(winner)
-        # Remove all instances of this winner to prevent duplicate wins
-        weighted_list = [name for name in weighted_list if name != winner]
+    if pool:
+        shuffled = pool.copy()
+        random.shuffle(shuffled)
+        for name in shuffled:
+            if name not in winners:
+                winners.append(name)
+            if len(winners) >= min(num, len(set(pool))):
+                break
 
-    draw_number += 1
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Save to history
-    save_history(draw_number, current_time, winners)
+    draw_counter += 1
+    save_history_row(draw_counter, prize, winners)
 
-    # Final result
-    result_text = (
-        f"🎉 Lucky Draw #{draw_number}\n\n"
-        f"👥 Participants: {total_participants}\n"
-        f"🎟 Total Tickets: {total_tickets}\n\n"
-        f"🏆 Winner(s):\n" + "\n".join(f"- {w}" for w in winners)
-    )
-    
-    try:
-        await shuffle_msg.edit_text(result_text)
-    except Exception as e:
-        # If we can't edit the message, send a new one
-        await update.message.reply_text(result_text)
-        logger.error(f"Error editing shuffle message: {e}")
-
-    # Reset participants after draw
-    participants.clear()
-    save_participants()
-
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not os.path.exists(HISTORY_FILE):
-        await update.message.reply_text("⚠️ No history yet.")
-        return
-
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()[1:]  # Skip header
-    except IOError as e:
-        await update.message.reply_text("⚠️ Error reading history file.")
-        logger.error(f"Error in history: {e}")
-        return
-
-    if not lines:
-        await update.message.reply_text("⚠️ No history yet.")
-        return
-
-    msg = "📜 Lucky Draw History:\n\n"
-    for line in lines[-5:]:  # last 5 draws
-        parts = line.strip().split(",")
-        if len(parts) >= 3:
-            draw_num, date, winners = parts[0], parts[1], ",".join(parts[2:])
-            msg += f"#{draw_num} ({date}): {winners}\n"
-
-    await update.message.reply_text(msg)
-
-async def clear_participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    try:
-        chat_member = await context.bot.get_chat_member(update.effective_chat.id, user_id)
-        
-        if not is_admin(chat_member):
-            await update.message.reply_text("⚠️ This command is for admins only.")
-            return
-    except Exception as e:
-        await update.message.reply_text("⚠️ Error verifying admin status.")
-        logger.error(f"Error in clear_participants: {e}")
-        return
-
-    count = len(participants)
-    participants.clear()
-    save_participants()
-    await update.message.reply_text(f"🧹 Cleared {count} participants!")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle errors in the telegram bot."""
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
-    
-    if update and update.effective_message:
+    # For each winner: generate PNG wheel, send it, then announce the winner
+    # Visual wheel has segments but not mapped to names; it's just for show.
+    for idx, winner in enumerate(winners, start=1):
+        # pick a random segment to highlight (visual)
+        seg_index = random.randrange(0, WHEEL_SEGMENTS)
+        png_path = f"wheel_{draw_counter}_{idx}.png"
         try:
-            await update.effective_message.reply_text("⚠️ An error occurred. Please try again later.")
-        except Exception as e:
-            logger.error(f"Error in error_handler: {e}")
+            generate_wheel_png(png_path, highlight_index=seg_index, segments=WHEEL_SEGMENTS, size=WHEEL_SIZE)
+            await update.message.reply_photo(InputFile(png_path), caption=f"🎡 Spinning for winner #{idx}...")
+        except Exception:
+            await update.message.reply_text("🎰 Spinning...")
 
-# --- Main ---
+        # small pause for drama
+        await asyncio.sleep(1.2)
+        # announce winner (with prize if provided)
+        if prize:
+            await update.message.reply_text(f"🏆 Winner #{idx} — {winner} — Prize: *{prize}*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text(f"🏆 Winner #{idx} — {winner}")
+
+        # increment winner count in memory
+        for uid, info in participants.items():
+            if info["username"] == winner:
+                info["wins"] = info.get("wins", 0) + 1
+
+        # cleanup generated png
+        try:
+            if os.path.exists(png_path):
+                os.remove(png_path)
+        except:
+            pass
+
+    # final summary
+    summary = [f"🎉 Lucky Draw #{draw_counter}"]
+    if prize:
+        summary.append(f"🎁 Prize: {prize}")
+    summary.append(f"👥 Participants: {total_participants}")
+    summary.append(f"🎟 Total Tickets: {total_tickets}")
+    summary.append("🏁 Winners:")
+    summary.extend([f"- {w}" for w in winners])
+    await update.message.reply_text("\n".join(summary))
+
+    # after draw: clear participants for next round
+    participants.clear()
+
+# schedule: /schedule HH:MM N Prize min=X
+async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /schedule HH:MM N Prize words... [min=X]")
+        return
+    time_str = context.args[0]
+    try:
+        hh, mm = time_str.split(":")
+        hh = int(hh); mm = int(mm)
+        target_time = dtime(hh, mm)
+    except:
+        await update.message.reply_text("Invalid time. Use HH:MM (24h).")
+        return
+    try:
+        num = int(context.args[1])
+    except:
+        await update.message.reply_text("Provide number of winners N.")
+        return
+
+    # parse min= token in rest
+    minp = 1
+    prize_parts = []
+    for tok in context.args[2:]:
+        if tok.startswith("min="):
+            try:
+                minp = int(tok.split("=",1)[1])
+            except:
+                pass
+        else:
+            prize_parts.append(tok)
+    prize = " ".join(prize_parts).strip()
+
+    # compute next occurrence of target_time (server time)
+    now = datetime.now()
+    dt_target = datetime.combine(now.date(), target_time)
+    if dt_target <= now:
+        dt_target += timedelta(days=1)
+    delay = (dt_target - now).total_seconds()
+
+    async def job():
+        await asyncio.sleep(delay)
+        if len(participants) < minp:
+            await update.message.reply_text(f"Scheduled draw canceled: need at least {minp} participants (now {len(participants)}).")
+            return
+        # simulate admin calling /draw with args
+        class Ctx: pass
+        ctx = Ctx()
+        ctx.args = [str(num)] + ([prize] if prize else [])
+        # call draw_handler directly (reuse)
+        await draw_handler(update, type("obj", (), {"args": ctx.args}))
+
+    task = asyncio.create_task(job())
+    scheduled_tasks.append({"time": time_str, "num": num, "prize": prize or "-", "min": minp})
+    await update.message.reply_text(f"✅ Scheduled draw at {time_str} for prize '{prize or '-'}' (min {minp}).")
+
+# bonus toggle: /bonus on|off
+async def bonus_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global bonus_enabled
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /bonus on OR /bonus off")
+        return
+    a = context.args[0].lower()
+    if a in ("on","true","1"):
+        bonus_enabled = True
+        await update.message.reply_text("✅ Bonus tickets enabled.")
+    else:
+        bonus_enabled = False
+        await update.message.reply_text("✅ Bonus tickets disabled.")
+
+# stats
+async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total_draws = len(history_rows)
+    cur_participants = len(participants)
+    total_tickets = sum(info["tickets"] for info in participants.values()) if participants else 0
+    top_winners = sorted(((info.get("wins",0), info["username"]) for info in participants.values()), reverse=True)[:5]
+    top_participants = sorted(((info["tickets"], info["username"]) for info in participants.values()), reverse=True)[:5]
+    lines = [f"📊 Stats:",
+             f"- Draws this session: {total_draws}",
+             f"- Current participants: {cur_participants}",
+             f"- Current total tickets: {total_tickets}",
+             "",
+             "🏆 Top winners (current session):"]
+    for wins, name in top_winners:
+        if wins>0:
+            lines.append(f"- {name}: {wins} win(s)")
+    lines.append("")
+    lines.append("🎟 Top ticket holders:")
+    for t, name in top_participants:
+        lines.append(f"- {name}: {t} tickets")
+    await update.message.reply_text("\n".join(lines))
+
+# history (last N) and export
+async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = 10
+    if context.args and context.args[0].isdigit():
+        n = int(context.args[0])
+    if not history_rows:
+        await update.message.reply_text("No history this session.")
+        return
+    lines = [f"📜 Draw history (last {n}):"]
+    for row in history_rows[-n:]:
+        lines.append(f"- #{row[0]} {row[1]} Prize: {row[2]} Winners: {', '.join(row[3])}")
+    await update.message.reply_text("\n".join(lines))
+
+async def export_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    if os.path.exists(HISTORY_CSV):
+        await update.message.reply_document(InputFile(HISTORY_CSV), caption="Full draw history (this session)")
+    else:
+        await update.message.reply_text("No history file available.")
+
+# config display and quick changes: /config, /require on/off, /setchannel name
+async def config_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    txt = f"⚙️ Current config:\n- Require membership: {'✅' if REQUIRE_MEMBERSHIP else '❌'}\n- Required channel: @{REQUIRED_CHANNEL if REQUIRED_CHANNEL else '(none)'}\n- Bonus enabled: {'✅' if bonus_enabled else '❌'}"
+    await update.message.reply_text(txt)
+
+async def require_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global REQUIRE_MEMBERSHIP
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /require on OR /require off")
+        return
+    a = context.args[0].lower()
+    REQUIRE_MEMBERSHIP = a in ("on","true","1")
+    await update.message.reply_text(f"✅ Require membership set to {REQUIRE_MEMBERSHIP}")
+
+async def setchannel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global REQUIRED_CHANNEL
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /setchannel ChannelName (without @)")
+        return
+    REQUIRED_CHANNEL = context.args[0].lstrip("@")
+    await update.message.reply_text(f"✅ Required channel set to @{REQUIRED_CHANNEL}")
+
+# clear participants
+async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update, context):
+        await update.message.reply_text("Admins only.")
+        return
+    participants.clear()
+    await update.message.reply_text("✅ Participants cleared.")
+
+# help
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await is_admin(update, context):
+        text = (
+            "Admin commands:\n"
+            "/start - show join button\n"
+            "/draw [N] [Prize] - draw N winners\n"
+            "/schedule HH:MM N Prize min=X - schedule next draw\n"
+            "/participants - list participants\n"
+            "/addtickets @name N\n"
+            "/resettickets @name\n"
+            "/bonus on|off\n"
+            "/stats\n"
+            "/history [N]\n"
+            "/export\n"
+            "/require on|off\n"
+            "/setchannel name\n"
+            "/clear\n"
+        )
+    else:
+        text = "User commands:\n/start - show join button\n/help - this message\n(enter via button or /enter)"
+    await update.message.reply_text(text)
+
+# ----------------- Main -----------------
 def main():
-    app = Application.builder().token(TOKEN).build()
+    if not TOKEN:
+        print("ERROR: BOT_TOKEN env var not set.")
+        return
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(enter_draw_callback, pattern="enter_draw"))
-    app.add_handler(CommandHandler("participants", list_participants))
-    app.add_handler(CommandHandler("addtickets", add_tickets))
-    app.add_handler(CommandHandler("draw", draw_winner))
-    app.add_handler(CommandHandler("history", history))
-    app.add_handler(CommandHandler("clear", clear_participants))
-    
-    # Add error handler
-    app.add_error_handler(error_handler)
-
-    print("Bot is running...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+    app = Appli
