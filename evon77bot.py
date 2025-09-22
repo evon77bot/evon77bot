@@ -5,7 +5,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # === CONFIG ===
 TOKEN = os.getenv("BOT_TOKEN")  # Add this as environment variable in Render
-ADMIN_IDS = [123456789]  # Replace with your Telegram user ID(s)
+ADMIN_IDS = [7379218059]  # Replace with your Telegram user ID(s)
 
 # === STORAGE ===
 participants = {}  # {user_id: {"username": str, "tickets": int}}
@@ -208,4 +208,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
