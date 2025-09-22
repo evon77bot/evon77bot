@@ -51,7 +51,7 @@ async def enter_draw(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if user_id in participants:
         participants[user_id] = {"username": username, "tickets": 1}
-        await query.answer(""username"🎟 You have entered the lucky draw!")
+        await query.answer("🎟 You have entered the lucky draw!")
     else:
         await query.answer("✅ You are already in the lucky draw.")
 
@@ -208,6 +208,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
