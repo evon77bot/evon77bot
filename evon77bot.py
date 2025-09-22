@@ -23,7 +23,7 @@ from telegram.ext import (
 # CONFIG
 # =========================
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [123456789]  # 👈 Replace with your Telegram user ID(s)
+ADMIN_IDS = [7379218059]  # 👈 Replace with your Telegram user ID(s)
 
 participants = {}   # user_id → {"username": str, "tickets": int, "wins": int}
 bonus_enabled = False
@@ -182,3 +182,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
